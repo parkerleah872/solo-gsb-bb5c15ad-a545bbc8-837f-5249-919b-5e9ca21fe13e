@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS windows (
     PRIMARY KEY (device_id, window_start)
 );
 
+-- 跨设备窗口检索按 (window_start, device_id) 排序/keyset 翻页：建同序复合索引
+CREATE INDEX IF NOT EXISTS idx_windows_start_device
+    ON windows (window_start, device_id);
+
 CREATE TABLE IF NOT EXISTS corrections (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     device_id    TEXT NOT NULL,

@@ -1,6 +1,6 @@
 # 传感器遥测汇聚 API
 
-基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）与**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）。
+基于 **FastAPI + SQLite** 的传感器遥测汇聚服务，支持事件时间水位线、允许迟到窗口、幂等去重与迟到数据修正，提供**设备可版本化标签**（全量替换、键名规范化、乐观并发 `if_version`、按当前标签筛选设备），并提供**设备组同步窗口汇总**（固定成员组，sum/avg，全成员封存才出数，迟到修正原位升版）、**组窗口修订审计**（首次 ready 与每次升版在同事务追加不可变快照，提供修订列表与两版本 diff）、**封存窗口稳健异常检测**（对已封存窗口事件按中位数/MAD 打稳健分数，纯只读）与**跨设备窗口检索**（`GET /windows/search`，按窗口时间范围、状态、设备标签筛选，绑定筛选条件的稳定游标分页，新增数据不重复不遗漏）。
 
 ## 核心语义
 
@@ -47,23 +47,44 @@
 - **状态码**：设备不存在或该设备在 `window_start` 处没有窗口（从未有事件落入）返回 `404`；窗口存在但仍是 `open`（未封存）返回 `409`。
 - **纯只读**：检测过程只执行查询，不修改事件、窗口聚合（count/sum/avg/min/max）、封存状态与修正计数。
 
+### 跨设备窗口检索（只读，稳定游标分页）
+
+- **跨设备组合筛选**：`GET /windows/search` 在**全部设备**范围内检索窗口，可自由组合以下条件，均为可选、不带即不过滤：
+  - `window_start_from` / `window_start_to`：窗口起始时间范围，**闭区间**（均为 ISO 8601；下界晚于上界返回 `422`）；
+  - `status`：`open` 或 `sealed`，精确匹配窗口状态；
+  - `label_key`（可单独给）/ `label_value`（必须配合 `label_key`，否则 `422`）：按设备**当前**标签精确筛选，键名规范化与筛选语义与 `GET /devices` 完全一致。
+- **排序与响应**：结果按 `(window_start, device_id)` 升序返回窗口聚合与设备标识，单条元素结构与 `GET /devices/{id}/windows` 完全相同；响应为 `{"items": [...], "next_cursor": "..." }`。
+- **稳定 keyset 游标分页**：用 `limit`（默认 `100`，`1–500`，越界 `422`）控制每页条数；本页取满时响应中的 `next_cursor` 非空，把它原样作为下一次请求的 `cursor` 参数即可继续；最后一页 `next_cursor` 为 `null`。游标**绑定了全部筛选条件**（HMAC-SHA256 签名，内含本页末条排序键与签发时间），不依赖 OFFSET：排序键 `(window_start, device_id)` 不可变，翻页期间即使有新数据写入，后续条目也不会位移，**不会重复或遗漏**；
+- **非法游标**：游标被篡改、签名不符、格式损坏、**超过有效期**（默认 300 秒，可用环境变量 `TELEMETRY_WINDOWS_SEARCH_CURSOR_TTL` 调整；多副本部署可用 `TELEMETRY_CURSOR_SECRET` 固化签名密钥），或与当前请求的筛选条件不一致（例如游标来自 `status=sealed` 的查询却拿去请求 `status=open`），一律返回 **400**，客户端应丢弃游标、从第一页重新开始。
+
 ## 启动
 
 ### Docker（推荐，一键启动）
 
-确保已安装 Docker Engine 与 Docker Compose 插件，然后在项目根目录执行**单条命令**：
+确保已安装 Docker Engine 与 Docker Compose 插件（`docker compose version` 可用），然后在项目根目录执行**单条命令**：
 
 ```bash
+# 前台启动（首次或依赖变更时加 --build 构建镜像；Ctrl+C 停止）
 docker compose up --build
+
+# 后台运行
+docker compose up -d --build
+
+# 查看后台日志 / 服务状态 / 停止
+docker compose logs -f
+docker compose ps
+docker compose down
 ```
 
-服务在前台启动（加 `-d` 可后台运行），监听并映射宿主机 **8000** 端口：
+服务监听并映射宿主机 **8000** 端口，启动后可直接访问：
 
 - 健康检查：http://localhost:8000/health
 - Swagger 交互式文档：http://localhost:8000/docs
 - ReDoc 文档：http://localhost:8000/redoc
+- 跨设备窗口检索示例：<http://localhost:8000/windows/search?limit=20>，
+  组合筛选如 <http://localhost:8000/windows/search?status=sealed&label_key=room&label_value=Hall-A&limit=20>
 
-停止服务用 `Ctrl+C`（后台模式则 `docker compose down`）。数据保存在 Docker 卷 `telemetry-data` 中，`docker compose down` 不会删除；如需清空可执行 `docker compose down -v`。
+数据保存在 Docker 卷 `telemetry-data` 中，`docker compose down` 不会删除；如需清空可执行 `docker compose down -v`。
 
 Compose 还配置了基于 `/health` 的健康检查（仅用镜像自带 Python，无需额外工具）：可用 `docker compose ps` 查看 `healthy`/`unhealthy` 状态。
 
@@ -88,6 +109,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `TELEMETRY_DB_PATH` | `telemetry.db`（本地）/ `/data/telemetry.db`（容器） | SQLite 数据库文件路径；容器内 `/data` 已挂载卷持久化 |
+| `TELEMETRY_WINDOWS_SEARCH_CURSOR_TTL` | `300` | `/windows/search` 游标有效期（秒），过期游标返回 400 |
+| `TELEMETRY_CURSOR_SECRET` | 进程启动时随机生成 | `/windows/search` 游标签名密钥；多进程/多副本部署显式设置同一值以便游标跨进程可用 |
 
 设备默认窗口参数（也可经 `PUT /devices/{id}/config` 逐设备覆盖）：
 
@@ -468,6 +491,48 @@ curl 'http://localhost:8000/devices/sensor-001/anomalies?window_start=2026-09-22
 - 当窗口 MAD 为 0（过半事件等于中位数）时，所有不等于中位数的事件均判为异常，其 `score` 为 `null`。
 - 设备不存在或窗口不存在返回 `404`；窗口尚未封存（`open`）返回 `409`；`threshold <= 0` 返回 `422`。
 
+### 16. 跨设备窗口检索（游标分页）
+
+先给两个设备打上标签并各上报若干事件（沿用前面示例中的 `sensor-001` / `sensor-002`），然后跨设备检索：
+
+```bash
+# 只看 10:00–10:02 之间、已封存、且 room=Hall-A 的设备窗口，每页 20 条
+curl 'http://localhost:8000/windows/search?window_start_from=2026-09-22T10:00:00Z&window_start_to=2026-09-22T10:02:00Z&status=sealed&label_key=room&label_value=Hall-A&limit=20'
+
+# 也可以只按状态 / 只按时间范围 / 只按键筛选，或不带任何条件拉全量
+curl 'http://localhost:8000/windows/search?status=open'
+curl 'http://localhost:8000/windows/search?window_start_from=2026-09-22T10:00:00Z'
+curl 'http://localhost:8000/windows/search?label_key=room'
+```
+
+响应按 `(window_start, device_id)` 升序返回窗口聚合与设备标识；本页取满时带回 `next_cursor`，把它原样作为 `cursor` 翻到下一页：
+
+```json
+{
+  "items": [
+    {
+      "device_id": "sensor-001",
+      "window_start": "2026-09-22T10:00:00Z",
+      "window_end": "2026-09-22T10:01:00Z",
+      "status": "sealed",
+      "count": 3, "sum": 64.4, "avg": 21.4667, "min": 20.9, "max": 22.0,
+      "correction_count": 1, "late_event_count": 1,
+      "sealed_at": "2026-09-22T10:02:31Z"
+    }
+  ],
+  "next_cursor": "eyJkIjoic2Vuc29yLTAwMSIsImYiOiJ7Ii4uLn0iLCJpIjoxNzU4NTk0NjAwLCJ3IjoxNzU4NTk0MDAwLjB9.abCdEF..."
+}
+```
+
+```bash
+curl 'http://localhost:8000/windows/search?status=sealed&limit=20&cursor=eyJkIjo...abCdEF'
+# 末页 next_cursor 为 null；游标只能用于签发它的同一组筛选条件，且默认 5 分钟内有效
+```
+
+- 游标绑定筛选条件且经签名：篡改、格式损坏、超过有效期，或与当前筛选条件不一致均返回 `400`，此时请从第一页重新开始。
+- 分页基于不可变排序键 `(window_start, device_id)`（keyset，非 OFFSET），翻页期间写入新窗口不会造成重复或遗漏。
+- `window_start_from` 晚于 `window_start_to`、只给 `label_value` 不给 `label_key` 返回 `422`。
+
 ## 接口一览
 
 | 方法 | 路径 | 说明 |
@@ -482,6 +547,7 @@ curl 'http://localhost:8000/devices/sensor-001/anomalies?window_start=2026-09-22
 | `GET` | `/devices/{device_id}/windows` | 各时间窗聚合值、状态、修正次数（支持 `?status=open\|sealed`） |
 | `GET` | `/devices/{device_id}/corrections` | 迟到数据修正记录 |
 | `GET` | `/devices/{device_id}/anomalies?window_start=&threshold=3.5` | 已封存窗口事件的中位数/MAD 稳健异常检测（只读；窗口不存在 404，未封存 409，threshold≤0 为 422） |
+| `GET` | `/windows/search` | 跨设备窗口检索：按窗口时间范围 / `status` / 设备标签筛选，按 `(window_start, device_id)` 升序，绑定筛选条件的稳定游标分页（`limit`/`cursor`，非法或过期游标 400） |
 | `POST` | `/groups` | 创建设备组（固定成员、sum/avg、窗口配置一致校验） |
 | `GET` | `/groups/{group_id}` | 组信息与成员列表 |
 | `GET` | `/groups/{group_id}/windows` | 组窗口汇总列表（支持 `?status=pending\|ready&window_start=...`） |
@@ -502,6 +568,7 @@ tests/
   test_groups.py    # 设备组测试（pending/ready、修正升版、重试幂等、成员明细）
   test_revisions.py # 修订审计测试（快照留档、diff、422/404、不可变性、旧库 baseline 补档）
   test_anomalies.py # 封存窗口稳健异常检测测试（中位数/MAD 打分、MAD=0、404/409/422、只读）
+  test_window_search.py # 跨设备窗口检索测试（时间范围/状态/标签筛选、keyset 游标分页、游标 400/422）
 Dockerfile
 docker-compose.yml
 requirements.txt
