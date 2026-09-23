@@ -46,16 +46,33 @@
 - MAD 为 0（超过半数事件等于中位数）时，除以 0 无定义：按需求把所有**不等于中位数**的事件
   一律判为异常返回，其 score 记为 null；全部等于中位数则无异常。
 - 设备或窗口不存在返回 404，窗口尚未封存（open）返回 409；接口纯只读，不改变任何现有聚合。
+
+跨设备窗口检索（稳定游标分页，只读）：
+- GET /windows/search 跨设备检索窗口，可按窗口时间范围（对 window_start 取半开区间 [start, end)）、
+  open/sealed 状态及设备**当前**标签（label_key/label_value，语义与 GET /devices 一致）精确筛选，
+  按 window_start、device_id 升序返回窗口聚合与设备标识。
+- 分页采用与筛选条件绑定的不透明游标：游标内嵌 (window_start, device_id) 键集位置、
+  首次查询时的行快照上界（windows 表 MAX(rowid)）与规范化后的全部筛选条件，
+  并以 HMAC-SHA256 签名防篡改、默认 1 小时过期。翻页期间**新增**的窗口行 rowid 超出快照上界，
+  不会进入本次遍历，因此新增数据既不会在翻页中重复出现也不会挤掉/插入造成遗漏
+  （不带游标重新发起检索即可看到新增数据）。
+- 游标签名非法、载荷损坏、已过期，或与本次请求的筛选条件不一致，一律返回 400。
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import math
+import os
 import re
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -68,6 +85,10 @@ MAX_GROUP_MEMBERS = 500
 MAX_DEVICE_LABELS = 20
 MAX_LABEL_KEY_LENGTH = 63
 MAX_LABEL_VALUE_LENGTH = 256
+# 跨设备窗口检索：分页大小与游标有效期（秒）；游标在有效期内可稳定翻完首次检索的快照
+SEARCH_DEFAULT_LIMIT = 100
+SEARCH_MAX_LIMIT = 1000
+SEARCH_CURSOR_TTL_SECONDS = 3600
 # 规范化后的合法键名：小写字母/数字开头，其余允许下划线、点、连字符
 LABEL_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 
@@ -79,7 +100,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.4.0", lifespan=lifespan)
+app = FastAPI(title="Sensor Telemetry Aggregation API", version="1.5.0", lifespan=lifespan)
 
 # 稳健异常检测：基于中位数/MAD 的修正 z 分数，0.6745 为正态分布下 MAD ≈ 0.6745σ 的换算系数
 DEFAULT_ANOMALY_THRESHOLD = 3.5
@@ -161,6 +182,13 @@ class WindowOut(BaseModel):
     correction_count: int
     late_event_count: int
     sealed_at: Optional[datetime]
+
+
+class WindowSearchResponse(BaseModel):
+    # 窗口聚合与设备标识，按 window_start、device_id 升序
+    windows: list[WindowOut]
+    # 下一页游标（不透明，仅与本次筛选条件绑定）；没有更多数据时为 null
+    next_cursor: Optional[str] = None
 
 
 class CorrectionOut(BaseModel):
@@ -388,6 +416,114 @@ def get_device_labels(conn: sqlite3.Connection, device_id: str) -> dict[str, str
         (device_id,),
     ).fetchall()
     return {r["label_key"]: r["label_value"] for r in rows}
+
+
+def window_row_to_out(r: sqlite3.Row) -> WindowOut:
+    return WindowOut(
+        device_id=r["device_id"],
+        window_start=to_iso(r["window_start"]),
+        window_end=to_iso(r["window_end"]),
+        status=r["status"],
+        count=r["count"],
+        sum=r["sum"],
+        avg=r["sum"] / r["count"] if r["count"] else None,
+        min=r["min"],
+        max=r["max"],
+        correction_count=r["correction_count"],
+        late_event_count=r["late_event_count"],
+        sealed_at=r["sealed_at"],
+    )
+
+
+# ---------- 跨设备窗口检索：游标编解码 ----------
+
+# 进程级签名密钥：首次需要时惰性生成；服务重启后旧游标签名自然失效（按非法游标返回 400）。
+_cursor_secret: Optional[bytes] = None
+
+
+def _get_cursor_secret() -> bytes:
+    global _cursor_secret
+    if _cursor_secret is None:
+        _cursor_secret = os.urandom(32)
+    return _cursor_secret
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(text: str) -> bytes:
+    padding = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + padding)
+
+
+def _sign(payload_b64: str) -> str:
+    return hmac.new(
+        _get_cursor_secret(), payload_b64.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+
+
+def encode_search_cursor(
+    window_start: float,
+    device_id: str,
+    snapshot_max_rowid: int,
+    filters: dict[str, Any],
+    issued_at: Optional[float] = None,
+) -> str:
+    """生成不透明游标：载荷为版本化 JSON（base64url），附 HMAC-SHA256 签名。"""
+    payload = {
+        "v": 1,
+        "ws": window_start,
+        "did": device_id,
+        "snap": snapshot_max_rowid,
+        "iss": issued_at if issued_at is not None else time.time(),
+        "f": filters,
+    }
+    payload_b64 = _b64url_encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    )
+    return payload_b64 + "." + _sign(payload_b64)
+
+
+def decode_search_cursor(cursor: str, filters: dict[str, Any]) -> dict[str, Any]:
+    """校验并解码游标，返回载荷；任何非法情形（含过期、筛选条件不一致）抛 400。
+
+    - 结构损坏/载荷不是合法 JSON/缺字段/签名不匹配 → 400（防篡改、防伪造）；
+    - 超过 SEARCH_CURSOR_TTL_SECONDS → 400（过期游标必须重新发起检索）；
+    - 游标绑定的筛选条件与当前请求不一致 → 400（游标只在同一组筛选下有效）。
+    """
+    invalid = HTTPException(status_code=400, detail="invalid cursor")
+    try:
+        payload_b64, _, sig = cursor.partition(".")
+        if not payload_b64 or not sig or not hmac.compare_digest(sig, _sign(payload_b64)):
+            raise invalid
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise invalid
+        if payload.get("v") != 1:
+            raise invalid
+        window_start = float(payload["ws"])
+        device_id = payload["did"]
+        snapshot_max_rowid = int(payload["snap"])
+        issued_at = float(payload["iss"])
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        # ValueError/UnicodeError: base64 或数值转换失败；KeyError: 缺字段
+        raise invalid
+
+    if not isinstance(device_id, str) or not device_id:
+        raise invalid
+    if time.time() - issued_at > SEARCH_CURSOR_TTL_SECONDS:
+        raise HTTPException(status_code=400, detail="cursor expired; please restart the search")
+    if payload.get("f") != filters:
+        raise HTTPException(
+            status_code=400,
+            detail="cursor does not match the current filter parameters",
+        )
+    return {
+        "window_start": window_start,
+        "device_id": device_id,
+        "snapshot_max_rowid": snapshot_max_rowid,
+    }
 
 
 # ---------- 设备组工具 ----------
@@ -888,23 +1024,7 @@ def list_windows(
             params.append(status)
         sql += " ORDER BY window_start"
         rows = conn.execute(sql, params).fetchall()
-        return [
-            WindowOut(
-                device_id=r["device_id"],
-                window_start=to_iso(r["window_start"]),
-                window_end=to_iso(r["window_end"]),
-                status=r["status"],
-                count=r["count"],
-                sum=r["sum"],
-                avg=r["sum"] / r["count"] if r["count"] else None,
-                min=r["min"],
-                max=r["max"],
-                correction_count=r["correction_count"],
-                late_event_count=r["late_event_count"],
-                sealed_at=r["sealed_at"],
-            )
-            for r in rows
-        ]
+        return [window_row_to_out(r) for r in rows]
 
 
 @app.get("/devices/{device_id}/corrections", response_model=list[CorrectionOut])
@@ -927,6 +1047,129 @@ def list_corrections(device_id: str) -> list[CorrectionOut]:
             )
             for r in rows
         ]
+
+
+# ---------- 跨设备窗口检索接口 ----------
+
+@app.get("/windows/search", response_model=WindowSearchResponse)
+def search_windows(
+    start: Optional[datetime] = Query(
+        default=None, description="窗口时间范围下界（对 window_start，含），ISO 8601"
+    ),
+    end: Optional[datetime] = Query(
+        default=None, description="窗口时间范围上界（对 window_start，不含），ISO 8601"
+    ),
+    status: Optional[Literal["open", "sealed"]] = Query(
+        default=None, description="窗口状态精确筛选"
+    ),
+    label_key: Optional[str] = Query(default=None, description="设备当前标签键（规范化后匹配）"),
+    label_value: Optional[str] = Query(default=None, description="设备当前标签值（与 label_key 同时给出时按键值精确匹配）"),
+    limit: int = Query(default=SEARCH_DEFAULT_LIMIT, ge=1, le=SEARCH_MAX_LIMIT),
+    cursor: Optional[str] = Query(default=None, description="上一页返回的 next_cursor；只可用于相同筛选条件"),
+) -> WindowSearchResponse:
+    """跨设备检索窗口（稳定游标分页，只读）。
+
+    按窗口时间范围（对 window_start 的半开区间 [start, end)）、open/sealed 状态及设备
+    **当前**标签精确筛选，按 window_start、device_id 升序返回窗口聚合与设备标识。
+    设备标签筛选语义与 GET /devices 一致：label_key+label_value 精确匹配键值对、
+    仅 label_key 匹配含该键的设备、只给 label_value 返回 422。
+
+    分页游标与本次筛选条件绑定并签名：翻页期间新增的窗口不会进入本次遍历的行快照，
+    既不会在后续页重复出现，也不会把原有行挤出本页或插入到已遍历区间造成遗漏；
+    需要看新增数据时不带 cursor 重新发起检索即可。游标非法、篡改、过期或与当前筛选
+    条件不一致均返回 400。
+    """
+    if label_key is not None and label_key.strip() == "":
+        label_key = None
+    if label_value is not None and label_key is None:
+        raise HTTPException(status_code=422, detail="label_value requires label_key to be set")
+
+    start_epoch = to_epoch(start) if start is not None else None
+    end_epoch = to_epoch(end) if end is not None else None
+    if start_epoch is not None and end_epoch is not None and end_epoch <= start_epoch:
+        raise HTTPException(
+            status_code=422, detail="end must be strictly greater than start"
+        )
+
+    key = label_key.strip().lower() if label_key is not None else None
+    value = label_value.strip() if label_value is not None else None
+    # 游标绑定的规范化筛选条件（JSON 可序列化、与请求解码后的形态比较）
+    filters: dict[str, Any] = {
+        "start": start_epoch,
+        "end": end_epoch,
+        "status": status,
+        "label_key": key,
+        "label_value": value,
+    }
+
+    with db.session() as conn:
+        if cursor is not None:
+            cur = decode_search_cursor(cursor, filters)
+            anchor_ws = cur["window_start"]
+            anchor_device = cur["device_id"]
+            snapshot_max_rowid = cur["snapshot_max_rowid"]
+        else:
+            anchor_ws = None
+            anchor_device = None
+            # 首次检索固定行快照上界：本事务内 rowid 大于该值的行（翻页期间新增）一律忽略，
+            # 保证后续页与首页遍历的是同一份稳定集合
+            row = conn.execute("SELECT COALESCE(MAX(rowid), 0) AS m FROM windows").fetchone()
+            snapshot_max_rowid = row["m"]
+
+        sql = "SELECT w.* FROM windows w"
+        # JOIN 占位符在语句文本上先于 WHERE，参数分两组按出现顺序组装
+        join_params: list[Any] = []
+        clauses = ["w.rowid <= ?"]
+        where_params: list[Any] = [snapshot_max_rowid]
+        if start_epoch is not None:
+            clauses.append("w.window_start >= ?")
+            where_params.append(start_epoch)
+        if end_epoch is not None:
+            clauses.append("w.window_start < ?")
+            where_params.append(end_epoch)
+        if status is not None:
+            clauses.append("w.status = ?")
+            where_params.append(status)
+        if key is not None:
+            # device_labels 主键 (device_id, label_key) 保证每个设备至多匹配一行，JOIN 不会产生重复窗口
+            if value is not None:
+                sql += (
+                    " JOIN device_labels dl ON dl.device_id = w.device_id"
+                    " AND dl.label_key = ? AND dl.label_value = ?"
+                )
+                join_params.extend([key, value])
+            else:
+                sql += (
+                    " JOIN device_labels dl ON dl.device_id = w.device_id"
+                    " AND dl.label_key = ?"
+                )
+                join_params.append(key)
+        if anchor_ws is not None:
+            # 键集翻页：(window_start, device_id) 严格大于游标锚点
+            clauses.append(
+                "(w.window_start > ? OR (w.window_start = ? AND w.device_id > ?))"
+            )
+            where_params.extend([anchor_ws, anchor_ws, anchor_device])
+
+        sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY w.window_start, w.device_id LIMIT ?"
+
+        rows = conn.execute(sql, [*join_params, *where_params, limit + 1]).fetchall()
+        has_more = len(rows) > limit
+        page = rows[:limit]
+        windows = [window_row_to_out(r) for r in page]
+
+        next_cursor: Optional[str] = None
+        if has_more:
+            last = page[-1]
+            next_cursor = encode_search_cursor(
+                last["window_start"],
+                last["device_id"],
+                snapshot_max_rowid,
+                filters,
+            )
+
+        return WindowSearchResponse(windows=windows, next_cursor=next_cursor)
 
 
 # ---------- 封存窗口稳健异常检测接口 ----------
